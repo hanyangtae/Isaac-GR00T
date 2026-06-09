@@ -78,6 +78,7 @@ class WrapperConfigs:
 
 def get_robocasa_env_fn(
     env_name: str,
+    seed: int | None = None,
 ):
     def env_fn():
         import os
@@ -87,7 +88,10 @@ def get_robocasa_env_fn(
         import robosuite  # noqa: F401
 
         os.environ["MUJOCO_GL"] = "egl"
-        return gym.make(env_name, enable_render=True)
+        kwargs = {"enable_render": True}
+        if seed is not None:
+            kwargs["seed"] = int(seed)  # robocasa kitchen __init__ 의 seed (env.rng 초기화).
+        return gym.make(env_name, **kwargs)
 
     return env_fn
 
@@ -157,8 +161,12 @@ def get_behavior_env_fn(
     return env_fn
 
 
-def get_gym_env(env_name: str, env_idx: int, total_n_envs: int):
-    """Create Ray environment factory function without wrappers."""
+def get_gym_env(env_name: str, env_idx: int, total_n_envs: int, seed: int | None = None):
+    """Create Ray environment factory function without wrappers.
+
+    ``seed`` 가 주어지면 robocasa kitchen env 의 내부 RNG 를 고정 (gym.make(seed=...)) 해
+    reset 시 동일한 layout/style/instruction 을 sample (재현 가능 evaluation).
+    """
 
     env_embodiment = get_embodiment_tag_from_env_name(env_name)
 
@@ -166,7 +174,7 @@ def get_gym_env(env_name: str, env_idx: int, total_n_envs: int):
         EmbodimentTag.GR1,
         EmbodimentTag.ROBOCASA_PANDA_OMRON,
     ):
-        env_fn = get_robocasa_env_fn(env_name)
+        env_fn = get_robocasa_env_fn(env_name, seed=seed)
 
     elif env_embodiment in (EmbodimentTag.UNITREE_G1,):
         env_fn = get_groot_locomanip_env_fn(env_name)
@@ -186,7 +194,11 @@ def get_gym_env(env_name: str, env_idx: int, total_n_envs: int):
 
 
 def create_eval_env(
-    env_name: str, env_idx: int, total_n_envs: int, wrapper_configs: WrapperConfigs
+    env_name: str,
+    env_idx: int,
+    total_n_envs: int,
+    wrapper_configs: WrapperConfigs,
+    seed: int | None = None,
 ) -> gym.Env:
     """Create a single evaluation environment with wrappers.
 
@@ -194,11 +206,13 @@ def create_eval_env(
         env_name: Name of the gymnasium environment to use
         idx: Environment index (used to determine video recording)
         wrapper_configs: Configuration for environment wrappers
+        seed: 주면 env_idx 별로 서로 다른 deterministic seed 사용 (재현가능 평가).
     Returns:
         Wrapped gymnasium environment
     """
 
-    env = get_gym_env(env_name, env_idx, total_n_envs)
+    env_seed = None if seed is None else int(seed) + env_idx
+    env = get_gym_env(env_name, env_idx, total_n_envs, seed=env_seed)
     if wrapper_configs.video.video_dir is not None:
         from gr00t.eval.sim.wrapper.video_recording_wrapper import (
             VideoRecorder,
@@ -239,6 +253,7 @@ def run_rollout_gymnasium_policy(
     wrapper_configs: WrapperConfigs,
     n_episodes: int = 10,
     n_envs: int = 1,
+    eval_seed: int | None = None,
 ) -> Any:
     """Run policy rollouts in parallel environments.
 
@@ -263,6 +278,7 @@ def run_rollout_gymnasium_policy(
             env_name=env_name,
             total_n_envs=n_envs,
             wrapper_configs=wrapper_configs,
+            seed=eval_seed,
         )
         for idx in range(n_envs)
     ]
@@ -282,12 +298,52 @@ def run_rollout_gymnasium_policy(
     current_lengths = [0] * n_envs
     completed_episodes = 0
     current_successes = [False] * n_envs
+    current_languages: list[str] = [""] * n_envs  # 현재 episode 의 instruction (reset 시점)
     episode_successes = []
     episode_infos = defaultdict(list)
 
-    # Initial reset
-    observations, _ = env.reset()
+    def _extract_lang(obs, idx, env_obj=None):
+        """robocasa instruction 캡처. 우선순위:
+        1) obs["annotation.human.task_description"] (모델 입력 prompt — atomic task 도 채움)
+        2) obs["language"] (composite task 에서만 채움, atomic 은 빈 문자열)
+        3) sub_env.get_ep_meta()["lang"] (env 직접 호출 fallback).
+        """
+        for key in (
+            "annotation.human.action.task_description",  # robocasa obs 의 실제 src key
+            "annotation.human.task_description",
+            "language",
+        ):
+            if isinstance(obs, dict) and key in obs:
+                v = obs[key]
+                try:
+                    if isinstance(v, (list, tuple)) or hasattr(v, "__getitem__"):
+                        item = v[idx]
+                    else:
+                        item = v
+                    s = str(item) if item is not None else ""
+                    if s and s != "[]":
+                        return s
+                except Exception:
+                    pass
+        if env_obj is not None:
+            try:
+                sub_env = env_obj.envs[idx] if hasattr(env_obj, "envs") else env_obj
+                while hasattr(sub_env, "env"):
+                    sub_env = sub_env.env
+                meta = sub_env.unwrapped.get_ep_meta()
+                return str(meta.get("lang", "") or meta.get("task_description", ""))
+            except Exception:
+                return ""
+        return ""
+
+    # Initial reset — eval_seed 가 주면 sub-env 마다 deterministic seed.
+    reset_kwargs = {}
+    if eval_seed is not None:
+        reset_kwargs["seed"] = [int(eval_seed) + i for i in range(n_envs)]
+    observations, _ = env.reset(**reset_kwargs)
     policy.reset()
+    for ei in range(n_envs):
+        current_languages[ei] = _extract_lang(observations, ei, env)
     i = 0
 
     pbar = tqdm(total=n_episodes, desc="Episodes")
@@ -344,8 +400,11 @@ def run_rollout_gymnasium_policy(
                 # Accumulate results
                 episode_lengths.append(current_lengths[env_idx])
                 episode_successes.append(current_successes[env_idx])
+                episode_infos["language"].append(current_languages[env_idx])
                 # Reset trackers for this environment.
                 current_successes[env_idx] = False
+                # autoreset 직후 next_obs 는 새 episode 의 obs → language 갱신
+                current_languages[env_idx] = _extract_lang(next_obs, env_idx, env)
                 # only update completed_episodes if valid
                 if "valid" in episode_infos:
                     if episode_infos["valid"][-1]:
