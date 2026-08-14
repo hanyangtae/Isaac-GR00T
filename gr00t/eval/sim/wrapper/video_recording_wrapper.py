@@ -395,22 +395,17 @@ class VideoRecordingWrapper(gym.Wrapper):
                         text_size = cv2.getTextSize(language, font, font_scale, font_thickness)[0]
                     font_scale *= 0.9  # Scale back slightly to ensure fit
 
-                # Calculate position
+                # Draw the caption in an ADDED top margin instead of over the frame
+                # (default changed: the old bottom overlay obscured the scene).
+                banner_h = text_size[1] + 2 * padding + 10
+                # keep total height even for h264/yuv420p
+                if (banner_h + frame.shape[0]) % 2 == 1:
+                    banner_h += 1
+                banner = np.zeros((banner_h, frame.shape[1], 3), dtype=np.uint8)
                 text_x = padding
-                text_y = frame.shape[0] - 20
-
-                # Add dark background rectangle
-                cv2.rectangle(
-                    frame,
-                    (text_x - padding, text_y - text_size[1] - padding),
-                    (text_x + text_size[0] + padding, text_y + padding),
-                    (0, 0, 0),
-                    -1,
-                )
-
-                # Add text
+                text_y = banner_h - padding - 4
                 cv2.putText(
-                    frame,
+                    banner,
                     language,
                     (text_x, text_y),
                     font,
@@ -418,6 +413,7 @@ class VideoRecordingWrapper(gym.Wrapper):
                     font_color,
                     font_thickness,
                 )
+                frame = np.concatenate([banner, frame], axis=0)
 
             self.video_recorder.write_frame(frame)
 
